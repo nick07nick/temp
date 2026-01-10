@@ -1,0 +1,449 @@
+Index: src/plugins/camera_control.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>import subprocess\nfrom pathlib import Path\nfrom loguru import logger\nfrom src.core.pipeline import PipelineStage, FrameContext\n\n\nclass CameraControlPlugin(PipelineStage):\n    def __init__(self):\n        super().__init__(name=\"camera_control\")\n\n        # Вычисляем путь к утилите uvc-util\n        # src/plugins/camera_control.py -> ... -> uvc-util/src/uvc-util\n        self.root_dir = Path(__file__).parent.parent.parent\n        self.uvc_bin = self.root_dir / \"uvc-util\" / \"src\" / \"uvc-util\"\n\n        # Индекс камеры по умолчанию (можно вынести в конфиг)\n        self.device_index = \"0\"\n\n    def process(self, ctx: FrameContext):\n        \"\"\"\n        Отправляет текущее состояние настроек на фронтенд (для отрисовки ползунков).\n        \"\"\"\n        cfg = ctx.config\n\n        # Собираем данные. Используем getattr, чтобы не упасть, если поля нет в конфиге\n        data = {\n            \"exposure\": getattr(cfg, \"exposure\", -5),\n            \"gain\": getattr(cfg, \"gain\", 0),\n            \"auto_exposure\": getattr(cfg, \"auto_exposure\", 0),\n        }\n\n        # Кладем в \"почтовый ящик\" для отправки на UI\n        ctx.set_data(\"camera_control\", data)\n\n    def on_command(self, cmd: str, args: dict):\n        \"\"\"\n        Обрабатывает команды от фронтенда (нажатия кнопок и движение ползунков).\n        Этот метод вызывается PluginManager'ом автоматически.\n        \"\"\"\n        if cmd == \"SET_EXPOSURE\":\n            raw_val = int(args.get(\"value\", -5))\n            # Конвертация: Log2 (-13...-1) -> Absolute Time\n            # Пример: -5 -> 312\n            abs_val = int(10000 * (2 ** raw_val))\n            abs_val = max(1, abs_val)\n\n            logger.info(f\"\uD83D\uDCF8 Setting Exposure: Log={raw_val} -> Abs={abs_val}\")\n\n            # Сначала отключаем авто-экспозицию (режим 1 - Manual)\n            self._run_uvc([\"-s\", \"auto-exposure-mode=1\"])\n            self._run_uvc([\"-s\", f\"exposure-time-abs={abs_val}\"])\n\n        elif cmd == \"SET_GAIN\":\n            val = int(args.get(\"value\", 0))\n            logger.info(f\"\uD83C\uDF9A Setting Gain: {val}\")\n            self._run_uvc([\"-s\", f\"gain={val}\"])\n\n        elif cmd == \"AUTO_EXPOSURE\":\n            logger.info(\"\uD83D\uDD04 Setting Auto Exposure\")\n            # auto-exposure-mode=8 обычно означает Aperture Priority (Auto)\n            self._run_uvc([\"-s\", \"auto-exposure-mode=8\"])\n\n    def _run_uvc(self, args):\n        \"\"\"Вспомогательный метод для запуска uvc-util\"\"\"\n        if not self.uvc_bin.exists():\n            logger.error(f\"❌ UVC utility not found at {self.uvc_bin}\")\n            return\n\n        cmd = [str(self.uvc_bin), \"-I\", self.device_index] + args\n        try:\n            # Запускаем процесс, ждем 1 сек, чтобы не вешать пайплайн\n            subprocess.run(cmd, capture_output=True, text=True, timeout=1.0)\n        except Exception as e:\n            logger.error(f\"❌ UVC Error: {e}\")\n\n\n# Функция-фабрика (если твой PluginManager ищет её)\ndef create_plugin():\n    return CameraControlPlugin()
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/plugins/camera_control.py b/src/plugins/camera_control.py
+--- a/src/plugins/camera_control.py	
++++ b/src/plugins/camera_control.py	
+@@ -1,79 +1,75 @@
++# src/plugins/camera_control.py
+ import subprocess
+ from pathlib import Path
+ from loguru import logger
+ from src.core.pipeline import PipelineStage, FrameContext
++from src.core.event_bus import EventBus
+ 
+ 
+ class CameraControlPlugin(PipelineStage):
+-    def __init__(self):
++    def __init__(self, bus: EventBus = None):
+         super().__init__(name="camera_control")
++        self.bus = bus
+ 
+-        # Вычисляем путь к утилите uvc-util
+-        # src/plugins/camera_control.py -> ... -> uvc-util/src/uvc-util
++        # Путь к uvc-util (относительно этого файла)
+         self.root_dir = Path(__file__).parent.parent.parent
+         self.uvc_bin = self.root_dir / "uvc-util" / "src" / "uvc-util"
+-
+-        # Индекс камеры по умолчанию (можно вынести в конфиг)
+         self.device_index = "0"
+ 
+     def process(self, ctx: FrameContext):
+-        """
+-        Отправляет текущее состояние настроек на фронтенд (для отрисовки ползунков).
+-        """
++        """Чтение состояния для отправки на UI"""
+         cfg = ctx.config
+ 
+-        # Собираем данные. Используем getattr, чтобы не упасть, если поля нет в конфиге
++        # Просто читаем конфиг. Если мы поменяли настройки через uvc-util,
++        # камера сама вернет новые значения в следующем кадре, и они попадут в cfg
+         data = {
+-            "exposure": getattr(cfg, "exposure", -5),
++            "exposure": getattr(cfg, "exposure", 0),
+             "gain": getattr(cfg, "gain", 0),
+-            "auto_exposure": getattr(cfg, "auto_exposure", 0),
++            "auto_exposure": getattr(cfg, "auto_exposure", True),
+         }
+-
+-        # Кладем в "почтовый ящик" для отправки на UI
+         ctx.set_data("camera_control", data)
+ 
+     def on_command(self, cmd: str, args: dict):
+-        """
+-        Обрабатывает команды от фронтенда (нажатия кнопок и движение ползунков).
+-        Этот метод вызывается PluginManager'ом автоматически.
+-        """
+-        if cmd == "SET_EXPOSURE":
+-            raw_val = int(args.get("value", -5))
+-            # Конвертация: Log2 (-13...-1) -> Absolute Time
+-            # Пример: -5 -> 312
+-            abs_val = int(10000 * (2 ** raw_val))
+-            abs_val = max(1, abs_val)
+-
+-            logger.info(f"📸 Setting Exposure: Log={raw_val} -> Abs={abs_val}")
++        """Выполнение команд от UI"""
++        if cmd == "SET_PARAMS":
++            # args: {"exposure": 313, "auto_exposure": false}
+ 
+-            # Сначала отключаем авто-экспозицию (режим 1 - Manual)
+-            self._run_uvc(["-s", "auto-exposure-mode=1"])
+-            self._run_uvc(["-s", f"exposure-time-abs={abs_val}"])
+-
+-        elif cmd == "SET_GAIN":
+-            val = int(args.get("value", 0))
+-            logger.info(f"🎚 Setting Gain: {val}")
+-            self._run_uvc(["-s", f"gain={val}"])
++            # 1. Gain
++            if "gain" in args:
++                val = int(args["gain"])
++                logger.info(f"🎚 Setting Gain: {val}")
++                self._run_uvc(["-s", f"gain={val}"])
+ 
+-        elif cmd == "AUTO_EXPOSURE":
+-            logger.info("🔄 Setting Auto Exposure")
+-            # auto-exposure-mode=8 обычно означает Aperture Priority (Auto)
+-            self._run_uvc(["-s", "auto-exposure-mode=8"])
++            # 2. Auto Exposure
++            if "auto_exposure" in args:
++                is_auto = args["auto_exposure"]
++                # 8 = Auto (Aperture Priority), 1 = Manual
++                mode = "8" if is_auto else "1"
++                logger.info(f"🔄 Setting Auto Exposure: {mode}")
++                self._run_uvc(["-s", f"auto-exposure-mode={mode}"])
++
++            # 3. Exposure Absolute (ставим только если авто выключено)
++            if "exposure" in args:
++                val = int(args["exposure"])
++                logger.info(f"📸 Setting Exposure: {val}")
++                # На всякий случай форсируем Manual mode перед установкой значения
++                self._run_uvc(["-s", "auto-exposure-mode=1"])
++                self._run_uvc(["-s", f"exposure-time-abs={val}"])
+ 
+     def _run_uvc(self, args):
+-        """Вспомогательный метод для запуска uvc-util"""
++        """Запуск внешней утилиты"""
+         if not self.uvc_bin.exists():
+-            logger.error(f"❌ UVC utility not found at {self.uvc_bin}")
++            logger.error(f"❌ UVC binary not found: {self.uvc_bin}")
+             return
+ 
+         cmd = [str(self.uvc_bin), "-I", self.device_index] + args
+         try:
+-            # Запускаем процесс, ждем 1 сек, чтобы не вешать пайплайн
+-            subprocess.run(cmd, capture_output=True, text=True, timeout=1.0)
++            # timeout=0.5 чтобы не вешать систему если камера тупит
++            subprocess.run(cmd, capture_output=True, text=True, timeout=0.5)
+         except Exception as e:
+             logger.error(f"❌ UVC Error: {e}")
+ 
+ 
+-# Функция-фабрика (если твой PluginManager ищет её)
++# Фабрика (если используется старый loader)
+ def create_plugin():
+     return CameraControlPlugin()
+\ No newline at end of file
+Index: .idea/workspace.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project version=\"4\">\n  <component name=\"AutoImportSettings\">\n    <option name=\"autoReloadType\" value=\"SELECTIVE\" />\n  </component>\n  <component name=\"ChangeListManager\">\n    <list default=\"true\" id=\"dfcb042d-d8b2-4f4a-bb45-e8687a4852d0\" name=\"Changes\" comment=\"\">\n      <change afterPath=\"$PROJECT_DIR$/frontend/src/components/Workspace.jsx\" afterDir=\"false\" />\n      <change afterPath=\"$PROJECT_DIR$/frontend/src/context/RobotContext.jsx\" afterDir=\"false\" />\n      <change afterPath=\"$PROJECT_DIR$/frontend/src/widgets/CameraSettingsWidget.jsx\" afterDir=\"false\" />\n      <change afterPath=\"$PROJECT_DIR$/frontend/src/widgets/MetricsWidget.jsx\" afterDir=\"false\" />\n      <change afterPath=\"$PROJECT_DIR$/frontend/src/widgets/SystemControlWidget.jsx\" afterDir=\"false\" />\n      <change afterPath=\"$PROJECT_DIR$/frontend/src/widgets/registry.js\" afterDir=\"false\" />\n      <change beforePath=\"$PROJECT_DIR$/.idea/workspace.xml\" beforeDir=\"false\" afterPath=\"$PROJECT_DIR$/.idea/workspace.xml\" afterDir=\"false\" />\n      <change beforePath=\"$PROJECT_DIR$/frontend/src/App.jsx\" beforeDir=\"false\" afterPath=\"$PROJECT_DIR$/frontend/src/App.jsx\" afterDir=\"false\" />\n      <change beforePath=\"$PROJECT_DIR$/src/plugins/camera_control.py\" beforeDir=\"false\" afterPath=\"$PROJECT_DIR$/src/plugins/camera_control.py\" afterDir=\"false\" />\n      <change beforePath=\"$PROJECT_DIR$/tools/cam_exposure.py\" beforeDir=\"false\" afterPath=\"$PROJECT_DIR$/tools/cam_exposure.py\" afterDir=\"false\" />\n      <change beforePath=\"$PROJECT_DIR$/tools/check_camera_control.py\" beforeDir=\"false\" afterPath=\"$PROJECT_DIR$/tools/check_camera_control.py\" afterDir=\"false\" />\n    </list>\n    <option name=\"SHOW_DIALOG\" value=\"false\" />\n    <option name=\"HIGHLIGHT_CONFLICTS\" value=\"true\" />\n    <option name=\"HIGHLIGHT_NON_ACTIVE_CHANGELIST\" value=\"false\" />\n    <option name=\"LAST_RESOLUTION\" value=\"IGNORE\" />\n  </component>\n  <component name=\"FileTemplateManagerImpl\">\n    <option name=\"RECENT_TEMPLATES\">\n      <list>\n        <option value=\"Python Script\" />\n      </list>\n    </option>\n  </component>\n  <component name=\"FlaskConsoleOptions\" custom-start-script=\"import sys&#10;sys.path.extend([WORKING_DIR_AND_PYTHON_PATHS])&#10;from flask.cli import ScriptInfo&#10;locals().update(ScriptInfo(create_app=None).load_app().make_shell_context())&#10;print(&quot;Python %s on %s\\nApp: %s [%s]\\nInstance: %s&quot; % (sys.version, sys.platform, app.import_name, app.env, app.instance_path))\">\n    <envs>\n      <env key=\"FLASK_APP\" value=\"app\" />\n    </envs>\n    <option name=\"myCustomStartScript\" value=\"import sys&#10;sys.path.extend([WORKING_DIR_AND_PYTHON_PATHS])&#10;from flask.cli import ScriptInfo&#10;locals().update(ScriptInfo(create_app=None).load_app().make_shell_context())&#10;print(&quot;Python %s on %s\\nApp: %s [%s]\\nInstance: %s&quot; % (sys.version, sys.platform, app.import_name, app.env, app.instance_path))\" />\n    <option name=\"myEnvs\">\n      <map>\n        <entry key=\"FLASK_APP\" value=\"app\" />\n      </map>\n    </option>\n  </component>\n  <component name=\"Git.Settings\">\n    <option name=\"RECENT_BRANCH_BY_REPOSITORY\">\n      <map>\n        <entry key=\"$PROJECT_DIR$\" value=\"main\" />\n      </map>\n    </option>\n    <option name=\"RECENT_GIT_ROOT_PATH\" value=\"$PROJECT_DIR$\" />\n    <option name=\"RESET_MODE\" value=\"HARD\" />\n  </component>\n  <component name=\"ProblemsViewState\">\n    <option name=\"selectedTabId\" value=\"CurrentFile\" />\n  </component>\n  <component name=\"ProjectColorInfo\">{\n  &quot;associatedIndex&quot;: 6\n}</component>\n  <component name=\"ProjectId\" id=\"37LMAW3zZ6Eauc0WLq4mZ9N0f3Q\" />\n  <component name=\"ProjectViewState\">\n    <option name=\"hideEmptyMiddlePackages\" value=\"true\" />\n    <option name=\"showLibraryContents\" value=\"true\" />\n  </component>\n  <component name=\"PropertiesComponent\"><![CDATA[{\n  \"keyToString\": {\n    \"Node.js.CameraControl.js.executor\": \"Run\",\n    \"Python.__main__.executor\": \"Run\",\n    \"Python.ble-controller.executor\": \"Run\",\n    \"Python.calc_lines.executor\": \"Run\",\n    \"Python.cam_exposure.executor\": \"Run\",\n    \"Python.check_camera_control.executor\": \"Run\",\n    \"Python.control.executor\": \"Run\",\n    \"Python.controller.executor\": \"Run\",\n    \"Python.count_lines.executor\": \"Run\",\n    \"Python.dev_runner.executor\": \"Run\",\n    \"Python.generate_board.executor\": \"Run\",\n    \"Python.mac_native.executor\": \"Run\",\n    \"Python.main.executor\": \"Run\",\n    \"Python.src.main.executor\": \"Run\",\n    \"Python.webcam.executor\": \"Run\",\n    \"RunOnceActivity.ShowReadmeOnStart\": \"true\",\n    \"git-widget-placeholder\": \"develop\",\n    \"last_opened_file_path\": \"/Users/nikfrants/Documents/it/BikeFit/config\",\n    \"node.js.detected.package.eslint\": \"true\",\n    \"node.js.detected.package.tslint\": \"true\",\n    \"node.js.selected.package.eslint\": \"(autodetect)\",\n    \"node.js.selected.package.tslint\": \"(autodetect)\",\n    \"nodejs_package_manager_path\": \"npm\",\n    \"npm.start.executor\": \"Run\",\n    \"settings.editor.selected.configurable\": \"com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable\",\n    \"ts.external.directory.path\": \"/Applications/PyCharm.app/Contents/plugins/javascript-plugin/jsLanguageServicesImpl/external\",\n    \"vue.rearranger.settings.migration\": \"true\"\n  }\n}]]></component>\n  <component name=\"RecentsManager\">\n    <key name=\"CopyFile.RECENT_KEYS\">\n      <recent name=\"$PROJECT_DIR$/config\" />\n    </key>\n    <key name=\"MoveFile.RECENT_KEYS\">\n      <recent name=\"$PROJECT_DIR$/frontend/src/widgets\" />\n      <recent name=\"$PROJECT_DIR$/frontend/src\" />\n      <recent name=\"$PROJECT_DIR$/src/to_del\" />\n      <recent name=\"$PROJECT_DIR$/src/core\" />\n      <recent name=\"$PROJECT_DIR$/src/stages\" />\n    </key>\n  </component>\n  <component name=\"RunManager\" selected=\"Python.dev_runner\">\n    <configuration name=\"count_lines new\" type=\"PythonConfigurationType\" factoryName=\"Python\" temporary=\"true\">\n      <module name=\"BikeFit\" />\n      <option name=\"ENV_FILES\" value=\"\" />\n      <option name=\"INTERPRETER_OPTIONS\" value=\"\" />\n      <option name=\"PARENT_ENVS\" value=\"true\" />\n      <envs>\n        <env name=\"PYTHONUNBUFFERED\" value=\"1\" />\n      </envs>\n      <option name=\"SDK_HOME\" value=\"\" />\n      <option name=\"WORKING_DIRECTORY\" value=\"$PROJECT_DIR$/tools\" />\n      <option name=\"IS_MODULE_SDK\" value=\"true\" />\n      <option name=\"ADD_CONTENT_ROOTS\" value=\"true\" />\n      <option name=\"ADD_SOURCE_ROOTS\" value=\"true\" />\n      <EXTENSION ID=\"PythonCoverageRunConfigurationExtension\" runner=\"coverage.py\" />\n      <option name=\"SCRIPT_NAME\" value=\"$PROJECT_DIR$/tools/count_lines.py\" />\n      <option name=\"PARAMETERS\" value=\"$PROJECT_DIR$ py js jsx --exclude-dir node_modules logs docs uvc-util --exclude-file package-lock.json --exclude-pattern *_init_* --changes --only-changed --min-width 30\" />\n      <option name=\"SHOW_COMMAND_LINE\" value=\"false\" />\n      <option name=\"EMULATE_TERMINAL\" value=\"false\" />\n      <option name=\"MODULE_MODE\" value=\"false\" />\n      <option name=\"REDIRECT_INPUT\" value=\"false\" />\n      <option name=\"INPUT_FILE\" value=\"\" />\n      <method v=\"2\" />\n    </configuration>\n    <configuration name=\"count_lines\" type=\"PythonConfigurationType\" factoryName=\"Python\">\n      <module name=\"BikeFit\" />\n      <option name=\"ENV_FILES\" value=\"\" />\n      <option name=\"INTERPRETER_OPTIONS\" value=\"\" />\n      <option name=\"PARENT_ENVS\" value=\"true\" />\n      <envs>\n        <env name=\"PYTHONUNBUFFERED\" value=\"1\" />\n      </envs>\n      <option name=\"SDK_HOME\" value=\"\" />\n      <option name=\"SDK_NAME\" value=\"Python 3.10 (BikeFit)\" />\n      <option name=\"WORKING_DIRECTORY\" value=\"$PROJECT_DIR$/tools\" />\n      <option name=\"IS_MODULE_SDK\" value=\"false\" />\n      <option name=\"ADD_CONTENT_ROOTS\" value=\"true\" />\n      <option name=\"ADD_SOURCE_ROOTS\" value=\"true\" />\n      <EXTENSION ID=\"PythonCoverageRunConfigurationExtension\" runner=\"coverage.py\" />\n      <option name=\"SCRIPT_NAME\" value=\"$PROJECT_DIR$/tools/count_lines.py\" />\n      <option name=\"PARAMETERS\" value=\"$PROJECT_DIR$ py js jsx --exclude-dir node_modules logs docs uvc-util --exclude-file package-lock.json --exclude-pattern *_init_* --changes --min-width 30\" />\n      <option name=\"SHOW_COMMAND_LINE\" value=\"false\" />\n      <option name=\"EMULATE_TERMINAL\" value=\"false\" />\n      <option name=\"MODULE_MODE\" value=\"false\" />\n      <option name=\"REDIRECT_INPUT\" value=\"false\" />\n      <option name=\"INPUT_FILE\" value=\"\" />\n      <method v=\"2\" />\n    </configuration>\n    <configuration name=\"dev_runner\" type=\"PythonConfigurationType\" factoryName=\"Python\" nameIsGenerated=\"true\">\n      <module name=\"BikeFit\" />\n      <option name=\"ENV_FILES\" value=\"\" />\n      <option name=\"INTERPRETER_OPTIONS\" value=\"\" />\n      <option name=\"PARENT_ENVS\" value=\"true\" />\n      <envs>\n        <env name=\"PYTHONUNBUFFERED\" value=\"1\" />\n      </envs>\n      <option name=\"SDK_HOME\" value=\"\" />\n      <option name=\"SDK_NAME\" value=\"Python 3.10 (BikeFit)\" />\n      <option name=\"WORKING_DIRECTORY\" value=\"\" />\n      <option name=\"IS_MODULE_SDK\" value=\"false\" />\n      <option name=\"ADD_CONTENT_ROOTS\" value=\"true\" />\n      <option name=\"ADD_SOURCE_ROOTS\" value=\"true\" />\n      <EXTENSION ID=\"PythonCoverageRunConfigurationExtension\" runner=\"coverage.py\" />\n      <option name=\"SCRIPT_NAME\" value=\"$PROJECT_DIR$/dev_runner.py\" />\n      <option name=\"PARAMETERS\" value=\"\" />\n      <option name=\"SHOW_COMMAND_LINE\" value=\"false\" />\n      <option name=\"EMULATE_TERMINAL\" value=\"false\" />\n      <option name=\"MODULE_MODE\" value=\"false\" />\n      <option name=\"REDIRECT_INPUT\" value=\"false\" />\n      <option name=\"INPUT_FILE\" value=\"\" />\n      <method v=\"2\" />\n    </configuration>\n    <configuration name=\"src.main\" type=\"PythonConfigurationType\" factoryName=\"Python\">\n      <module name=\"BikeFit\" />\n      <option name=\"ENV_FILES\" value=\"\" />\n      <option name=\"INTERPRETER_OPTIONS\" value=\"\" />\n      <option name=\"PARENT_ENVS\" value=\"true\" />\n      <envs>\n        <env name=\"PYTHONUNBUFFERED\" value=\"1\" />\n      </envs>\n      <option name=\"SDK_HOME\" value=\"\" />\n      <option name=\"SDK_NAME\" value=\"Python 3.10 (BikeFit)\" />\n      <option name=\"WORKING_DIRECTORY\" value=\"\" />\n      <option name=\"IS_MODULE_SDK\" value=\"false\" />\n      <option name=\"ADD_CONTENT_ROOTS\" value=\"true\" />\n      <option name=\"ADD_SOURCE_ROOTS\" value=\"true\" />\n      <EXTENSION ID=\"PythonCoverageRunConfigurationExtension\" runner=\"coverage.py\" />\n      <option name=\"SCRIPT_NAME\" value=\"src.main\" />\n      <option name=\"PARAMETERS\" value=\"\" />\n      <option name=\"SHOW_COMMAND_LINE\" value=\"false\" />\n      <option name=\"EMULATE_TERMINAL\" value=\"false\" />\n      <option name=\"MODULE_MODE\" value=\"true\" />\n      <option name=\"REDIRECT_INPUT\" value=\"false\" />\n      <option name=\"INPUT_FILE\" value=\"\" />\n      <method v=\"2\" />\n    </configuration>\n    <list>\n      <item itemvalue=\"Python.dev_runner\" />\n      <item itemvalue=\"Python.src.main\" />\n      <item itemvalue=\"Python.count_lines\" />\n      <item itemvalue=\"Python.count_lines new\" />\n    </list>\n    <recent_temporary>\n      <list>\n        <item itemvalue=\"Python.count_lines new\" />\n      </list>\n    </recent_temporary>\n  </component>\n  <component name=\"SharedIndexes\">\n    <attachedChunks>\n      <set>\n        <option value=\"bundled-js-predefined-1d06a55b98c1-0b3e54e931b4-JavaScript-PY-241.19416.19\" />\n        <option value=\"bundled-python-sdk-337b0a7a993a-2767605e8bc2-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-241.19416.19\" />\n      </set>\n    </attachedChunks>\n  </component>\n  <component name=\"SpellCheckerSettings\" RuntimeDictionaries=\"0\" Folders=\"0\" CustomDictionaries=\"0\" DefaultDictionary=\"application-level\" UseSingleDictionary=\"true\" transferred=\"true\" />\n  <component name=\"TaskManager\">\n    <task active=\"true\" id=\"Default\" summary=\"Default task\">\n      <changelist id=\"dfcb042d-d8b2-4f4a-bb45-e8687a4852d0\" name=\"Changes\" comment=\"\" />\n      <created>1766677756173</created>\n      <option name=\"number\" value=\"Default\" />\n      <option name=\"presentableId\" value=\"Default\" />\n      <updated>1766677756173</updated>\n      <workItem from=\"1766677757096\" duration=\"4334000\" />\n      <workItem from=\"1766782260761\" duration=\"19432000\" />\n      <workItem from=\"1766876708815\" duration=\"34000\" />\n      <workItem from=\"1766876894989\" duration=\"1671000\" />\n      <workItem from=\"1766948855713\" duration=\"1828000\" />\n      <workItem from=\"1767003273608\" duration=\"34508000\" />\n      <workItem from=\"1767048284830\" duration=\"8241000\" />\n      <workItem from=\"1767119990481\" duration=\"19000\" />\n      <workItem from=\"1767192084883\" duration=\"23541000\" />\n      <workItem from=\"1767456597528\" duration=\"54754000\" />\n      <workItem from=\"1767605268294\" duration=\"11970000\" />\n      <workItem from=\"1767646010798\" duration=\"636000\" />\n      <workItem from=\"1767703401275\" duration=\"15948000\" />\n    </task>\n    <servers />\n  </component>\n  <component name=\"TypeScriptGeneratedFilesManager\">\n    <option name=\"version\" value=\"3\" />\n  </component>\n  <component name=\"Vcs.Log.Tabs.Properties\">\n    <option name=\"TAB_STATES\">\n      <map>\n        <entry key=\"MAIN\">\n          <value>\n            <State>\n              <option name=\"COLUMN_ID_WIDTH\">\n                <map>\n                  <entry key=\"Table.Default.Author.ColumnIdWidth\" value=\"109\" />\n                  <entry key=\"Table.Default.Date.ColumnIdWidth\" value=\"98\" />\n                  <entry key=\"Table.GitHub.CommitStatus.ColumnIdWidth\" value=\"56\" />\n                </map>\n              </option>\n            </State>\n          </value>\n        </entry>\n      </map>\n    </option>\n  </component>\n  <component name=\"com.intellij.coverage.CoverageDataManagerImpl\">\n    <SUITE FILE_PATH=\"coverage/BikeFit$camera_inspector.coverage\" NAME=\"camera_inspector Coverage Results\" MODIFIED=\"1766879265769\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/src/tools\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$check_camera_control.coverage\" NAME=\"check_camera_control Coverage Results\" MODIFIED=\"1767471468838\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/tools\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$dev_runner.coverage\" NAME=\"dev_runner Coverage Results\" MODIFIED=\"1767721239302\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$control.coverage\" NAME=\"control Coverage Results\" MODIFIED=\"1767367754097\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/sensors/accelerometer\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$src_main.coverage\" NAME=\"src.main Coverage Results\" MODIFIED=\"1766787006373\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$ble_controller.coverage\" NAME=\"ble-controller Coverage Results\" MODIFIED=\"1767375252758\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/src/hardware\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$webcam.coverage\" NAME=\"webcam Coverage Results\" MODIFIED=\"1766839890416\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/src/hardware\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$generate_board.coverage\" NAME=\"generate_board Coverage Results\" MODIFIED=\"1767609098179\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/tools\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$calc_lines.coverage\" NAME=\"count_lines Coverage Results\" MODIFIED=\"1767575532027\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/tools\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$mac_native.coverage\" NAME=\"mac_native Coverage Results\" MODIFIED=\"1767367704285\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/sensors/accelerometer\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$count_lines.coverage\" NAME=\"count_lines Coverage Results\" MODIFIED=\"1767718911088\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/tools\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$__main__.coverage\" NAME=\"src.main Coverage Results\" MODIFIED=\"1766679268325\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$controller.coverage\" NAME=\"controller Coverage Results\" MODIFIED=\"1767369827823\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/sensors/accelerometer\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$main.coverage\" NAME=\"main Coverage Results\" MODIFIED=\"1767036200328\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/src\" />\n    <SUITE FILE_PATH=\"coverage/BikeFit$cam_exposure.coverage\" NAME=\"cam_exposure Coverage Results\" MODIFIED=\"1767477071358\" SOURCE_PROVIDER=\"com.intellij.coverage.DefaultCoverageFileProvider\" RUNNER=\"coverage.py\" COVERAGE_BY_TEST_ENABLED=\"false\" COVERAGE_TRACING_ENABLED=\"false\" WORKING_DIRECTORY=\"$PROJECT_DIR$/tools\" />\n  </component>\n</project>
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.idea/workspace.xml b/.idea/workspace.xml
+--- a/.idea/workspace.xml	
++++ b/.idea/workspace.xml	
+@@ -5,17 +5,10 @@
+   </component>
+   <component name="ChangeListManager">
+     <list default="true" id="dfcb042d-d8b2-4f4a-bb45-e8687a4852d0" name="Changes" comment="">
+-      <change afterPath="$PROJECT_DIR$/frontend/src/components/Workspace.jsx" afterDir="false" />
+-      <change afterPath="$PROJECT_DIR$/frontend/src/context/RobotContext.jsx" afterDir="false" />
+-      <change afterPath="$PROJECT_DIR$/frontend/src/widgets/CameraSettingsWidget.jsx" afterDir="false" />
+-      <change afterPath="$PROJECT_DIR$/frontend/src/widgets/MetricsWidget.jsx" afterDir="false" />
+-      <change afterPath="$PROJECT_DIR$/frontend/src/widgets/SystemControlWidget.jsx" afterDir="false" />
+-      <change afterPath="$PROJECT_DIR$/frontend/src/widgets/registry.js" afterDir="false" />
+       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+-      <change beforePath="$PROJECT_DIR$/frontend/src/App.jsx" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/App.jsx" afterDir="false" />
++      <change beforePath="$PROJECT_DIR$/frontend/src/widgets/CameraSettingsWidget.jsx" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/widgets/CameraSettingsWidget.jsx" afterDir="false" />
++      <change beforePath="$PROJECT_DIR$/src/core/plugin_manager.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/to_del/plugin_manager.py" afterDir="false" />
+       <change beforePath="$PROJECT_DIR$/src/plugins/camera_control.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/plugins/camera_control.py" afterDir="false" />
+-      <change beforePath="$PROJECT_DIR$/tools/cam_exposure.py" beforeDir="false" afterPath="$PROJECT_DIR$/tools/cam_exposure.py" afterDir="false" />
+-      <change beforePath="$PROJECT_DIR$/tools/check_camera_control.py" beforeDir="false" afterPath="$PROJECT_DIR$/tools/check_camera_control.py" afterDir="false" />
+     </list>
+     <option name="SHOW_DIALOG" value="false" />
+     <option name="HIGHLIGHT_CONFLICTS" value="true" />
+@@ -43,7 +36,7 @@
+   <component name="Git.Settings">
+     <option name="RECENT_BRANCH_BY_REPOSITORY">
+       <map>
+-        <entry key="$PROJECT_DIR$" value="main" />
++        <entry key="$PROJECT_DIR$" value="b7389e8ba02b79d0921b500512ccfd663e700fb5" />
+       </map>
+     </option>
+     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+@@ -71,15 +64,17 @@
+     "Python.control.executor": "Run",
+     "Python.controller.executor": "Run",
+     "Python.count_lines.executor": "Run",
++    "Python.count_lines2.executor": "Run",
+     "Python.dev_runner.executor": "Run",
+     "Python.generate_board.executor": "Run",
+     "Python.mac_native.executor": "Run",
+     "Python.main.executor": "Run",
+     "Python.src.main.executor": "Run",
++    "Python.tree.executor": "Run",
+     "Python.webcam.executor": "Run",
+     "RunOnceActivity.ShowReadmeOnStart": "true",
+     "git-widget-placeholder": "develop",
+-    "last_opened_file_path": "/Users/nikfrants/Documents/it/BikeFit/config",
++    "last_opened_file_path": "/Users/nikfrants/Documents/it/BikeFit/tools",
+     "node.js.detected.package.eslint": "true",
+     "node.js.detected.package.tslint": "true",
+     "node.js.selected.package.eslint": "(autodetect)",
+@@ -93,12 +88,13 @@
+ }]]></component>
+   <component name="RecentsManager">
+     <key name="CopyFile.RECENT_KEYS">
++      <recent name="$PROJECT_DIR$/tools" />
+       <recent name="$PROJECT_DIR$/config" />
+     </key>
+     <key name="MoveFile.RECENT_KEYS">
++      <recent name="$PROJECT_DIR$/src/to_del" />
+       <recent name="$PROJECT_DIR$/frontend/src/widgets" />
+       <recent name="$PROJECT_DIR$/frontend/src" />
+-      <recent name="$PROJECT_DIR$/src/to_del" />
+       <recent name="$PROJECT_DIR$/src/core" />
+       <recent name="$PROJECT_DIR$/src/stages" />
+     </key>
+@@ -195,6 +191,29 @@
+       <option name="SHOW_COMMAND_LINE" value="false" />
+       <option name="EMULATE_TERMINAL" value="false" />
+       <option name="MODULE_MODE" value="true" />
++      <option name="REDIRECT_INPUT" value="false" />
++      <option name="INPUT_FILE" value="" />
++      <method v="2" />
++    </configuration>
++    <configuration name="tree" type="PythonConfigurationType" factoryName="Python">
++      <module name="BikeFit" />
++      <option name="ENV_FILES" value="" />
++      <option name="INTERPRETER_OPTIONS" value="" />
++      <option name="PARENT_ENVS" value="true" />
++      <envs>
++        <env name="PYTHONUNBUFFERED" value="1" />
++      </envs>
++      <option name="SDK_HOME" value="" />
++      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/tools" />
++      <option name="IS_MODULE_SDK" value="true" />
++      <option name="ADD_CONTENT_ROOTS" value="true" />
++      <option name="ADD_SOURCE_ROOTS" value="true" />
++      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
++      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/tools/tree.py" />
++      <option name="PARAMETERS" value="$PROJECT_DIR$ py js jsx --exclude-dir node_modules logs docs uvc-util --exclude-file package-lock.json --exclude-pattern *_init_*" />
++      <option name="SHOW_COMMAND_LINE" value="false" />
++      <option name="EMULATE_TERMINAL" value="false" />
++      <option name="MODULE_MODE" value="false" />
+       <option name="REDIRECT_INPUT" value="false" />
+       <option name="INPUT_FILE" value="" />
+       <method v="2" />
+@@ -203,6 +222,7 @@
+       <item itemvalue="Python.dev_runner" />
+       <item itemvalue="Python.src.main" />
+       <item itemvalue="Python.count_lines" />
++      <item itemvalue="Python.tree" />
+       <item itemvalue="Python.count_lines new" />
+     </list>
+     <recent_temporary>
+@@ -267,8 +287,9 @@
+   </component>
+   <component name="com.intellij.coverage.CoverageDataManagerImpl">
+     <SUITE FILE_PATH="coverage/BikeFit$camera_inspector.coverage" NAME="camera_inspector Coverage Results" MODIFIED="1766879265769" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/tools" />
++    <SUITE FILE_PATH="coverage/BikeFit$count_lines2.coverage" NAME="count_lines2 Coverage Results" MODIFIED="1767723080943" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/tools" />
+     <SUITE FILE_PATH="coverage/BikeFit$check_camera_control.coverage" NAME="check_camera_control Coverage Results" MODIFIED="1767471468838" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/tools" />
+-    <SUITE FILE_PATH="coverage/BikeFit$dev_runner.coverage" NAME="dev_runner Coverage Results" MODIFIED="1767721239302" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
++    <SUITE FILE_PATH="coverage/BikeFit$dev_runner.coverage" NAME="dev_runner Coverage Results" MODIFIED="1767722510123" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
+     <SUITE FILE_PATH="coverage/BikeFit$control.coverage" NAME="control Coverage Results" MODIFIED="1767367754097" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/sensors/accelerometer" />
+     <SUITE FILE_PATH="coverage/BikeFit$src_main.coverage" NAME="src.main Coverage Results" MODIFIED="1766787006373" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
+     <SUITE FILE_PATH="coverage/BikeFit$ble_controller.coverage" NAME="ble-controller Coverage Results" MODIFIED="1767375252758" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/hardware" />
+@@ -277,6 +298,7 @@
+     <SUITE FILE_PATH="coverage/BikeFit$calc_lines.coverage" NAME="count_lines Coverage Results" MODIFIED="1767575532027" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/tools" />
+     <SUITE FILE_PATH="coverage/BikeFit$mac_native.coverage" NAME="mac_native Coverage Results" MODIFIED="1767367704285" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/sensors/accelerometer" />
+     <SUITE FILE_PATH="coverage/BikeFit$count_lines.coverage" NAME="count_lines Coverage Results" MODIFIED="1767718911088" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/tools" />
++    <SUITE FILE_PATH="coverage/BikeFit$tree.coverage" NAME="tree Coverage Results" MODIFIED="1767723191505" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/tools" />
+     <SUITE FILE_PATH="coverage/BikeFit$__main__.coverage" NAME="src.main Coverage Results" MODIFIED="1766679268325" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
+     <SUITE FILE_PATH="coverage/BikeFit$controller.coverage" NAME="controller Coverage Results" MODIFIED="1767369827823" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/sensors/accelerometer" />
+     <SUITE FILE_PATH="coverage/BikeFit$main.coverage" NAME="main Coverage Results" MODIFIED="1767036200328" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
+Index: frontend/src/widgets/CameraSettingsWidget.jsx
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>// frontend/src/widgets/CameraSettingsWidget.jsx\nimport React, { useState } from 'react';\nimport { useRobot } from '../context/RobotContext';\n\nexport const CameraSettingsWidget = () => {\n    const { sendCommand } = useRobot();\n    // В идеале значения должны приходить из pluginData.camera_settings\n    // Пока сделаем локально + отправка\n    const [exposure, setExposure] = useState(-5); // Default log value\n    const [gain, setGain] = useState(0);\n\n    const handleExposure = (e) => {\n        const val = parseInt(e.target.value);\n        setExposure(val);\n        // Отправляем команду плагину camera_control\n        sendCommand('camera_control', 'SET_EXPOSURE', { value: val });\n    };\n\n    const handleGain = (e) => {\n        const val = parseInt(e.target.value);\n        setGain(val);\n        sendCommand('camera_control', 'SET_GAIN', { value: val });\n    };\n\n    return (\n        <div style={{ padding: 15, color: 'white', height: '100%', overflowY: 'auto' }}>\n            <div style={{ marginBottom: 15 }}>\n                <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8em', marginBottom: 5 }}>\n                    <span style={{ color: '#94a3b8' }}>Exposure (Log)</span>\n                    <span style={{ fontWeight: 'bold' }}>{exposure}</span>\n                </label>\n                <input\n                    type=\"range\" min=\"-13\" max=\"-1\" step=\"1\"\n                    value={exposure} onChange={handleExposure}\n                    style={{ width: '100%', cursor: 'pointer' }}\n                />\n            </div>\n\n            <div style={{ marginBottom: 15 }}>\n                <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8em', marginBottom: 5 }}>\n                    <span style={{ color: '#94a3b8' }}>Gain</span>\n                    <span style={{ fontWeight: 'bold' }}>{gain}</span>\n                </label>\n                <input\n                    type=\"range\" min=\"0\" max=\"255\" step=\"1\"\n                    value={gain} onChange={handleGain}\n                    style={{ width: '100%', cursor: 'pointer' }}\n                />\n            </div>\n\n            <div style={{ paddingTop: 10, borderTop: '1px solid #334155' }}>\n                 <button\n                    onClick={() => sendCommand('camera_control', 'AUTO_EXPOSURE')}\n                    style={{ width: '100%', padding: 8, background: '#334155', color: '#e2e8f0', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: '0.8em' }}\n                 >\n                    Auto Setup\n                 </button>\n            </div>\n        </div>\n    );\n};
+===================================================================
+diff --git a/frontend/src/widgets/CameraSettingsWidget.jsx b/frontend/src/widgets/CameraSettingsWidget.jsx
+--- a/frontend/src/widgets/CameraSettingsWidget.jsx	
++++ b/frontend/src/widgets/CameraSettingsWidget.jsx	
+@@ -1,60 +1,136 @@
+ // frontend/src/widgets/CameraSettingsWidget.jsx
+-import React, { useState } from 'react';
++import React, { useState, useEffect, useRef } from 'react';
+ import { useRobot } from '../context/RobotContext';
+ 
++// Твоя "золотая" последовательность
++const EXPOSURE_STEPS = [1, 2, 3, 6, 11, 21, 40, 79, 157, 313, 626, 1251, 2501, 5001];
++
+ export const CameraSettingsWidget = () => {
+-    const { sendCommand } = useRobot();
+-    // В идеале значения должны приходить из pluginData.camera_settings
+-    // Пока сделаем локально + отправка
+-    const [exposure, setExposure] = useState(-5); // Default log value
+-    const [gain, setGain] = useState(0);
++    const { sendCommand, pluginData } = useRobot();
++    const data = pluginData?.camera_control || {};
++
++    const [localState, setLocalState] = useState({});
++    const [isDragging, setIsDragging] = useState(false);
++    const [isManual, setIsManual] = useState(false);
+ 
+-    const handleExposure = (e) => {
+-        const val = parseInt(e.target.value);
+-        setExposure(val);
+-        // Отправляем команду плагину camera_control
+-        sendCommand('camera_control', 'SET_EXPOSURE', { value: val });
++    // Хелпер для поиска индекса (если с камеры пришло 313, возвращаем индекс 9)
++    const getStepIndex = (val) => {
++        if (!val) return 4;
++        return EXPOSURE_STEPS.reduce((bestIdx, curr, currIdx) => {
++            const bestDiff = Math.abs(EXPOSURE_STEPS[bestIdx] - val);
++            const currDiff = Math.abs(curr - val);
++            return currDiff < bestDiff ? currIdx : bestIdx;
++        }, 0);
+     };
+ 
+-    const handleGain = (e) => {
+-        const val = parseInt(e.target.value);
+-        setGain(val);
+-        sendCommand('camera_control', 'SET_GAIN', { value: val });
++    // Синхронизация с данными от робота (когда не тащим слайдер)
++    useEffect(() => {
++        if (!isDragging) {
++            setLocalState(prev => ({ ...prev, ...data }));
++            if (data.auto_exposure !== undefined) {
++                setIsManual(data.auto_exposure === false);
++            }
++        }
++    }, [data, isDragging]);
++
++    const handleInteractionStart = () => setIsDragging(true);
++
++    const handleCommit = (key, val, isExposureIndex = false) => {
++        let finalVal = parseInt(val);
++        if (isExposureIndex) {
++            finalVal = EXPOSURE_STEPS[finalVal];
++        }
++
++        const payload = { [key]: finalVal };
++
++        // Если меняем экспозицию, принудительно ставим Manual
++        if (key === 'exposure') {
++            payload.auto_exposure = false;
++            setIsManual(true);
++        }
++
++        // Шлем команду плагину
++        sendCommand('camera_control', 'SET_PARAMS', payload);
++        setTimeout(() => setIsDragging(false), 200);
+     };
++
++    const handleExposureSlide = (e) => {
++        const idx = parseInt(e.target.value);
++        // Визуально обновляем мгновенно
++        setLocalState(prev => ({ ...prev, exposure: EXPOSURE_STEPS[idx] }));
++    };
++
++    const handleGainSlide = (e) => {
++        setLocalState(prev => ({ ...prev, gain: parseInt(e.target.value) }));
++    };
++
++    const toggleAutoMode = () => {
++        const newState = !isManual;
++        setIsManual(newState);
++        sendCommand('camera_control', 'SET_PARAMS', { "auto_exposure": !newState });
++    };
++
++    const currentExposureIdx = getStepIndex(localState.exposure);
+ 
+     return (
+-        <div style={{ padding: 15, color: 'white', height: '100%', overflowY: 'auto' }}>
+-            <div style={{ marginBottom: 15 }}>
+-                <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8em', marginBottom: 5 }}>
+-                    <span style={{ color: '#94a3b8' }}>Exposure (Log)</span>
+-                    <span style={{ fontWeight: 'bold' }}>{exposure}</span>
+-                </label>
++        <div style={{ padding: 15, color: 'white', background: '#1e293b', height: '100%', overflowY: 'auto' }}>
++            {/* Header */}
++            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
++                <span style={{ fontWeight: 'bold', color: '#cbd5e1' }}>Camera Settings</span>
++                <button
++                    onClick={toggleAutoMode}
++                    style={{
++                        fontSize:'0.75em', padding:'6px 12px',
++                        background: isManual ? '#4ade80' : '#3b82f6',
++                        border: 'none', color: isManual ? '#0f172a' : 'white',
++                        borderRadius: 4, cursor:'pointer', fontWeight:'bold',
++                        minWidth: '80px', transition: 'all 0.2s'
++                    }}
++                >
++                    {isManual ? "MANUAL" : "AUTO"}
++                </button>
++            </div>
++
++            {/* Exposure Slider (Discrete) */}
++            <div style={{ marginBottom: 20, opacity: isManual ? 1 : 0.5, pointerEvents: isManual ? 'auto' : 'none' }}>
++                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8em', marginBottom: 5, color: '#94a3b8' }}>
++                    <span>Exposure Time</span>
++                    <span style={{ color: '#fbbf24', fontWeight: 'bold' }}>
++                        {EXPOSURE_STEPS[currentExposureIdx] || 0} µs
++                    </span>
++                </div>
+                 <input
+-                    type="range" min="-13" max="-1" step="1"
+-                    value={exposure} onChange={handleExposure}
+-                    style={{ width: '100%', cursor: 'pointer' }}
++                    type="range"
++                    min={0}
++                    max={EXPOSURE_STEPS.length - 1}
++                    step={1}
++                    value={currentExposureIdx}
++                    onMouseDown={handleInteractionStart}
++                    onTouchStart={handleInteractionStart}
++                    onChange={handleExposureSlide}
++                    onMouseUp={(e) => handleCommit('exposure', e.target.value, true)}
++                    onTouchEnd={(e) => handleCommit('exposure', e.target.value, true)}
++                    style={{ width: '100%', cursor: 'pointer', accentColor: '#fbbf24' }}
+                 />
+             </div>
+ 
++            {/* Gain Slider (Linear) */}
+             <div style={{ marginBottom: 15 }}>
+-                <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8em', marginBottom: 5 }}>
+-                    <span style={{ color: '#94a3b8' }}>Gain</span>
+-                    <span style={{ fontWeight: 'bold' }}>{gain}</span>
+-                </label>
+-                <input
+-                    type="range" min="0" max="255" step="1"
+-                    value={gain} onChange={handleGain}
+-                    style={{ width: '100%', cursor: 'pointer' }}
+-                />
+-            </div>
+-
+-            <div style={{ paddingTop: 10, borderTop: '1px solid #334155' }}>
+-                 <button
+-                    onClick={() => sendCommand('camera_control', 'AUTO_EXPOSURE')}
+-                    style={{ width: '100%', padding: 8, background: '#334155', color: '#e2e8f0', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: '0.8em' }}
+-                 >
+-                    Auto Setup
+-                 </button>
++                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8em', marginBottom: 5, color: '#94a3b8' }}>
++                    <span>Gain</span>
++                    <span style={{ color: '#fff', fontWeight: 'bold' }}>{localState.gain || 0}</span>
++                </div>
++                <input
++                    type="range"
++                    min={0} max={255} step={1}
++                    value={localState.gain || 0}
++                    onMouseDown={handleInteractionStart}
++                    onTouchStart={handleInteractionStart}
++                    onChange={handleGainSlide}
++                    onMouseUp={(e) => handleCommit('gain', e.target.value)}
++                    onTouchEnd={(e) => handleCommit('gain', e.target.value)}
++                    style={{ width: '100%', cursor: 'pointer', accentColor: '#38bdf8' }}
++                />
+             </div>
+         </div>
+     );
+diff --git a/src/core/plugin_manager.py b/src/to_del/plugin_manager.py
+rename from src/core/plugin_manager.py
+rename to src/to_del/plugin_manager.py
