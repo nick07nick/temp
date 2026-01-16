@@ -1,0 +1,14 @@
+info.txt
+Архив.zip
+pycache/
+*.pyc
+*.json
+.env
+.venv/
+/frontend/node_modules/
+publish_to_ai.sh
+logs/
+docs/how_to_create_plugins.md
+data/calibration_sessions/cam_*/images/
+#data/calibration_sessions/cam_*/**/images/
+#data/calibration_sessions/cam_*/*/images/
